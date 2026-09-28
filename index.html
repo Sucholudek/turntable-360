@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turntable 360°</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #stage { position: fixed; inset: 0; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #stage.dragging { cursor: grabbing; }
+  canvas { width: 100%; height: 100%; display: block; }
+
+  #loader { position: fixed; inset: 0; display: grid; place-items: center; background: #fff; z-index: 10;
+    transition: opacity .4s; }
+  #loader.hide { opacity: 0; pointer-events: none; }
+  .bar { width: 220px; height: 3px; background: #e3e3e6; border-radius: 2px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: #b8894d; transition: width .15s; }
+</style>
+</head>
+<body>
+
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="loader"><div class="bar"><i id="loadBar"></i></div></div>
+
+<script>
+// Sekwencja: Sequence.0001.jpg … Sequence.0045.jpg (co druga klatka)
+const SRCS = [];
+for (let i = 1; i <= 45; i += 2) SRCS.push(`Sequence.${String(i).padStart(4, '0')}.jpg`);
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const stage = document.getElementById('stage');
+
+let frames = [];
+let pos = 0;              // ciągła pozycja (float) w klatkach
+let velocity = 0;         // bezwładność po puszczeniu (klatki / ms)
+let zoom = 1, panX = 0, panY = 0;
+let dragging = false, dragMode = 'rotate', lastX = 0, lastY = 0, lastT = 0;
+let lastDrawn = -1, dirty = true;
+
+const n = () => frames.length;
+const idx = () => ((Math.round(pos) % n()) + n()) % n();
+
+// ---------- Ładowanie ----------
+let loaded = 0;
+Promise.all(SRCS.map(src => new Promise(res => {
+  const img = new Image();
+  img.onload = img.onerror = () => {
+    document.getElementById('loadBar').style.width = (++loaded / SRCS.length * 100) + '%';
+    res(img.naturalWidth ? img : null);
+  };
+  img.src = src;
+}))).then(imgs => {
+  frames = imgs.filter(Boolean);
+  return Promise.all(frames.map(f => f.decode().catch(() => {})));
+}).then(() => {
+  dirty = true;
+  document.getElementById('loader').classList.add('hide');
+});
+
+// ---------- Rysowanie ----------
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  cv.width = Math.round(innerWidth * dpr);
+  cv.height = Math.round(innerHeight * dpr);
+  dirty = true;
+}
+addEventListener('resize', resize);
+resize();
+
+function draw() {
+  if (!n()) return;
+  const i = idx();
+  if (i === lastDrawn && !dirty) return;
+  lastDrawn = i; dirty = false;
+  const img = frames[i];
+  const W = cv.width, H = cv.height, dpr = W / innerWidth;
+  const s = Math.min(W / img.naturalWidth, H / img.naturalHeight) * zoom;
+  const w = img.naturalWidth * s, h = img.naturalHeight * s;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, (W - w) / 2 + panX * dpr, (H - h) / 2 + panY * dpr, w, h);
+}
+
+let prev = performance.now();
+function tick(now) {
+  const dt = Math.min(now - prev, 100); prev = now;
+  if (!dragging && Math.abs(velocity) > 0.0005) {
+    pos += velocity * dt;
+    velocity *= Math.pow(0.994, dt);
+  } else if (!dragging) velocity = 0;
+  draw();
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// ---------- Mysz: LPM = obrót, PPM = przesuwanie, kółko = zoom, dwuklik = reset ----------
+// ---------- Dotyk: 1 palec = obrót, 2 palce = zoom + przesuwanie, podwójne stuknięcie = reset ----------
+const pxPerFrame = () => Math.max(8, Math.min(30, innerWidth / (n() * 1.5 || 1)));
+const touches = new Map();
+let pinchDist = 0, pinchX = 0, pinchY = 0, lastTap = 0;
+
+function resetView() { zoom = 1; panX = panY = 0; dirty = true; }
+
+function pinchState() {
+  const [a, b] = [...touches.values()];
+  return { d: Math.hypot(a.x - b.x, a.y - b.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+stage.addEventListener('pointerdown', e => {
+  stage.setPointerCapture(e.pointerId);
+  if (e.pointerType === 'touch') {
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touches.size === 2) {
+      dragging = false; velocity = 0;
+      ({ d: pinchDist, x: pinchX, y: pinchY } = pinchState());
+      return;
+    }
+    const now = performance.now();
+    if (now - lastTap < 300) { resetView(); lastTap = 0; } else lastTap = now;
+  }
+  if (touches.size > 1) return;
+  dragging = true; velocity = 0;
+  dragMode = e.button === 2 ? 'pan' : 'rotate';
+  lastX = e.clientX; lastY = e.clientY; lastT = performance.now();
+  stage.classList.add('dragging');
+});
+stage.addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touches.size === 2) {
+      const p = pinchState();
+      if (pinchDist) zoomAt(p.d / pinchDist, p.x, p.y);
+      if (zoom > 1) { panX += p.x - pinchX; panY += p.y - pinchY; }
+      pinchDist = p.d; pinchX = p.x; pinchY = p.y;
+      return;
+    }
+  }
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  const now = performance.now(), dt = Math.max(now - lastT, 1);
+  if (dragMode === 'pan') {
+    if (zoom > 1) { panX += dx; panY += dy; dirty = true; }
+  } else {
+    const df = dx / pxPerFrame();
+    pos += df;
+    velocity = velocity * 0.6 + (df / dt) * 0.4;
+  }
+  lastX = e.clientX; lastY = e.clientY; lastT = now;
+});
+function endPointer(e) {
+  touches.delete(e.pointerId);
+  if (touches.size < 2) pinchDist = 0;
+  if (!dragging) return;
+  dragging = false;
+  stage.classList.remove('dragging');
+  if (performance.now() - lastT > 80) velocity = 0;
+  velocity = Math.max(-0.05, Math.min(0.05, velocity));
+}
+stage.addEventListener('pointerup', endPointer);
+stage.addEventListener('pointercancel', endPointer);
+stage.addEventListener('contextmenu', e => e.preventDefault());
+
+function zoomAt(factor, cx, cy) {
+  const nz = Math.max(1, Math.min(6, zoom * factor));
+  const f = nz / zoom;
+  const ox = cx - innerWidth / 2, oy = cy - innerHeight / 2;
+  panX = ox - (ox - panX) * f;
+  panY = oy - (oy - panY) * f;
+  zoom = nz;
+  if (zoom === 1) panX = panY = 0;
+  dirty = true;
+}
+stage.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+}, { passive: false });
+stage.addEventListener('dblclick', resetView);
+</script>
+</body>
+</html>
